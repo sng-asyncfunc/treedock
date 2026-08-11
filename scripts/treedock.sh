@@ -6,13 +6,40 @@
 # Meta is kept until branch-delete succeeds so --force-delete-branch remains retryable.
 set -euo pipefail
 
-VERSION="0.4.3"
+VERSION="0.5.0"
 
 # Absolute path to this script (for re-entry: prune --merged → down).
 TREEDOCK_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 die() { echo "treedock: $*" >&2; exit 1; }
 info() { echo "treedock: $*" >&2; }
+
+# --json: one JSON object on stdout; diagnostics stay on stderr via info/die.
+JSON_OUT=0
+json_out() { [[ "$JSON_OUT" == "1" ]]; }
+emit_json() {
+  # usage: emit_json key=val key=val ...  (vals are strings; true/false/null/numbers allowed raw)
+  python3 -c '
+import json,sys
+o={}
+for a in sys.argv[1:]:
+  if "=" not in a: continue
+  k,v=a.split("=",1)
+  if v=="true": o[k]=True
+  elif v=="false": o[k]=False
+  elif v=="null": o[k]=None
+  else:
+    try:
+      if v.isdigit() or (v.startswith("-") and v[1:].isdigit()):
+        o[k]=int(v)
+      else:
+        o[k]=v
+    except Exception:
+      o[k]=v
+print(json.dumps(o, ensure_ascii=False))
+' "$@"
+}
+
 
 need_git() {
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
@@ -133,19 +160,29 @@ plates_dir() {
   echo "$(main_worktree_root)/.worktrees"
 }
 
-ensure_worktrees_gitignore() {
+ensure_worktrees_ignored() {
   local root="$1"
-  (
-    cd "$root" || exit 1
-    if git check-ignore -q .worktrees/ 2>/dev/null; then
-      return 0
-    fi
-    if [[ -f .gitignore ]] && grep -qxF '.worktrees/' .gitignore 2>/dev/null; then
-      return 0
-    fi
-    info "adding .worktrees/ to .gitignore"
-    { echo; echo '# treedock paper plates'; echo '.worktrees/'; } >> .gitignore
-  )
+  local update_gitignore="${2:-0}"
+  local exclude
+  exclude="$(git -C "$root" rev-parse --git-path info/exclude)"
+  mkdir -p "$(dirname "$exclude")"
+  if ! grep -qxF '.worktrees/' "$exclude" 2>/dev/null; then
+    info "adding .worktrees/ to $exclude"
+    { echo; echo '# treedock plates'; echo '.worktrees/'; } >> "$exclude"
+  fi
+  if [[ "$update_gitignore" == "1" ]]; then
+    (
+      cd "$root" || exit 1
+      if git check-ignore -q .worktrees/ 2>/dev/null; then
+        return 0
+      fi
+      if [[ -f .gitignore ]] && grep -qxF '.worktrees/' .gitignore 2>/dev/null; then
+        return 0
+      fi
+      info "adding .worktrees/ to .gitignore (--update-gitignore)"
+      { echo; echo '# treedock plates'; echo '.worktrees/'; } >> .gitignore
+    )
+  fi
 }
 
 # Ignore in-plate marker so worktree stays clean for git worktree remove.
@@ -215,18 +252,30 @@ run_install() {
   case "$pm" in
     pnpm)
       command -v pnpm >/dev/null 2>&1 || die "pnpm not on PATH"
-      info "install: pnpm (prefer enableGlobalVirtualStore for multi-plate density)"
-      (cd "$dir" && pnpm install) >&2
+      info "install: pnpm frozen-if-lock (enableGlobalVirtualStore for multi-plate density)"
+      if [[ -f "$dir/pnpm-lock.yaml" ]]; then
+        (cd "$dir" && pnpm install --frozen-lockfile) >&2
+      else
+        (cd "$dir" && pnpm install) >&2
+      fi
       ;;
     bun)
       command -v bun >/dev/null 2>&1 || die "bun not on PATH"
-      info "install: bun"
-      (cd "$dir" && bun install) >&2
+      info "install: bun frozen-if-lock"
+      if [[ -f "$dir/bun.lockb" || -f "$dir/bun.lock" ]]; then
+        (cd "$dir" && bun install --frozen-lockfile) >&2
+      else
+        (cd "$dir" && bun install) >&2
+      fi
       ;;
     yarn)
       command -v yarn >/dev/null 2>&1 || die "yarn not on PATH"
-      info "install: yarn"
-      (cd "$dir" && yarn install) >&2
+      info "install: yarn frozen-if-lock"
+      if [[ -f "$dir/yarn.lock" ]]; then
+        (cd "$dir" && yarn install --frozen-lockfile) >&2
+      else
+        (cd "$dir" && yarn install) >&2
+      fi
       ;;
     npm)
       info "install: npm (warning: copies node_modules — ceramic plate risk)"
@@ -331,7 +380,7 @@ registered_worktree_paths() {
 }
 
 cmd_up() {
-  local target="" base="" no_docker=0 pr=""
+  local target="" base="" no_docker=0 no_install=0 pr="" update_gitignore=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --base)
@@ -339,6 +388,9 @@ cmd_up() {
         base="$2"; shift 2
         ;;
       --no-docker) no_docker=1; shift ;;
+      --no-install) no_install=1; shift ;;
+      --update-gitignore) update_gitignore=1; shift ;;
+      --json) JSON_OUT=1; shift ;;
       --pr)
         [[ -n "${2:-}" ]] || die "--pr requires a number"
         [[ "${2}" =~ ^[0-9]+$ ]] || die "--pr requires a positive integer (got '$2')"
@@ -346,8 +398,8 @@ cmd_up() {
         ;;
       -h|--help)
         cat <<'EOF'
-Usage: treedock up <branch-or-slug> [--base <ref>] [--no-docker]
-       treedock up --pr <N> [--base <ref>] [--no-docker]
+Usage: treedock up <branch-or-slug> [--base <ref>] [--no-docker] [--no-install] [--update-gitignore] [--json]
+       treedock up --pr <N> [same flags]
 EOF
         return 0
         ;;
@@ -384,7 +436,7 @@ EOF
   project="$(compose_project "$slug")"
   base="${base:-$(default_base)}"
 
-  ensure_worktrees_gitignore "$root"
+  ensure_worktrees_ignored "$root" "${update_gitignore:-0}"
   ensure_plate_exclude "$root"
   mkdir -p "$(plates_dir)" "$(meta_dir)"
 
@@ -427,10 +479,16 @@ EOF
   write_meta "$slug" "$branch" "$project" "$path" "" "0" "none" "$pr"
 
   local pm compose_file="" compose_used=0
-  # Install — on failure leave plate + meta for user; do not auto-delete (agent may want the tree)
-  if ! pm="$(run_install "$path")"; then
-    info "install failed — plate left at $path (meta at $(meta_path "$slug"))"
-    die "install failed"
+  if [[ "$no_install" -eq 1 ]]; then
+    pm="none"
+    info "install: skipped (--no-install)"
+  else
+    # Install — on failure leave plate + meta for user; do not auto-delete
+    if ! pm="$(run_install "$path")"; then
+      info "install failed — plate left at $path (meta at $(meta_path "$slug"))"
+      if json_out; then emit_json ok=false operation=up error=install-failed slug="$slug" path="$path" meta="$(meta_path "$slug")"; fi
+      die "install failed"
+    fi
   fi
   write_meta "$slug" "$branch" "$project" "$path" "" "0" "$pm" "$pr"
 
@@ -465,7 +523,10 @@ EOF
     compose_report="${project} (${compose_file})"
   fi
 
-  cat <<EOF
+  if json_out; then
+    emit_json ok=true operation=up slug="$slug" path="$path" branch="$branch" install="$pm" compose="$compose_report" meta="$(meta_path "$slug")" pr="${pr:-}"
+  else
+    cat <<EOF
 plate ready
   path:     $path
   branch:   $branch
@@ -478,20 +539,26 @@ plate ready
   # when done:
   treedock down $slug
 EOF
+  fi
 }
 
 cmd_down() {
-  local target="" delete_branch=0 force=0 force_delete_branch=0
+  local target="" delete_branch=0 force=0 force_delete_branch=0 discard_dirty=0 orphan_compose=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --delete-branch) delete_branch=1; shift ;;
       --force-delete-branch) force_delete_branch=1; delete_branch=1; shift ;;
-      --force) force=1; shift ;;
+      --force) force=1; discard_dirty=1; orphan_compose=1; shift ;;
+      --discard-dirty) discard_dirty=1; shift ;;
+      --allow-orphan-compose) orphan_compose=1; shift ;;
+      --json) JSON_OUT=1; shift ;;
       -h|--help)
-        echo "Usage: treedock down <slug-or-branch> [--delete-branch] [--force-delete-branch] [--force]"
-        echo "  --force                discard dirty plate + allow compose orphan on teardown failure"
-        echo "  --delete-branch        delete local branch if fully merged (-d only)"
-        echo "  --force-delete-branch  force-delete unmerged local branch (-D); retryable if meta kept"
+        echo "Usage: treedock down <slug> [--delete-branch] [--force-delete-branch] [--discard-dirty] [--allow-orphan-compose] [--force] [--json]"
+        echo "  --discard-dirty          allow removing a dirty worktree"
+        echo "  --allow-orphan-compose   allow down if compose teardown fails"
+        echo "  --force                  both of the above (legacy)"
+        echo "  --delete-branch          git branch -d if merged"
+        echo "  --force-delete-branch    git branch -D (retryable via meta)"
         return 0
         ;;
       *)
@@ -551,8 +618,9 @@ cmd_down() {
 
       # Fail closed when compose was used: tear down or require --force before dropping recovery.
       if [[ "$compose_used" == "1" ]]; then
-        if ! compose_teardown "$project" "${compose_file:-}" "$force" ""; then
-          die "ghost plate has compose_used=1 project=${project}. Meta kept at $(meta_path "$slug"). Fix docker/compose and retry, or pass --force to orphan"
+        if ! compose_teardown "$project" "${compose_file:-}" "$orphan_compose" ""; then
+          if json_out; then emit_json ok=false operation=down error=ghost-compose-failed slug="$slug" compose_project="$project"; fi
+          die "ghost plate has compose_used=1 project=${project}. Meta kept at $(meta_path "$slug"). Fix docker/compose and retry, or pass --allow-orphan-compose / --force"
         fi
         compose_used=0
       fi
@@ -577,7 +645,11 @@ cmd_down() {
         fi
       fi
       delete_meta "$slug"
-      echo "plate tossed (ghost): $slug"
+      if json_out; then
+        emit_json ok=true operation=down slug="$slug" ghost=true branch="${branch:-}" changed=true
+      else
+        echo "plate tossed (ghost): $slug"
+      fi
       return 0
     fi
     die "plate not found: $(plates_dir)/$slug (or meta path)"
@@ -609,26 +681,28 @@ cmd_down() {
     "${path_abs}/"*) cd "$root" ;;
   esac
 
-  # Dirty preflight BEFORE compose teardown on non-force (avoid half-tossed plate).
-  if [[ "$force" -eq 0 ]] && plate_is_dirty "$path"; then
-    die "plate is dirty (uncommitted changes at $path). Commit/stash, or pass --force to discard worktree and tear down compose"
+  # Dirty preflight BEFORE compose teardown (avoid half-tossed plate).
+  if [[ "$discard_dirty" -eq 0 ]] && plate_is_dirty "$path"; then
+    if json_out; then emit_json ok=false operation=down error=dirty slug="$slug" path="$path"; fi
+    die "plate is dirty (uncommitted changes at $path). Commit/stash, or pass --discard-dirty / --force"
   fi
 
-  # Compose teardown — only if this plate actually started compose (compose_used=1).
-  # Fail closed unless --force. Do not infer from compose.yaml alone (--no-docker plates).
+  # Compose teardown — only if compose_used=1. Fail closed unless --allow-orphan-compose/--force.
   if [[ "$compose_used" == "1" ]]; then
-    if ! compose_teardown "$project" "${compose_file:-}" "$force" "$path"; then
-      die "compose project ${project} still may be running. Fix docker/compose and retry, or pass --force to orphan the stack and remove the worktree"
+    if ! compose_teardown "$project" "${compose_file:-}" "$orphan_compose" "$path"; then
+      if json_out; then emit_json ok=false operation=down error=compose-teardown-failed slug="$slug" compose_project="$project"; fi
+      die "compose project ${project} still may be running. Fix docker/compose and retry, or pass --allow-orphan-compose / --force"
     fi
     compose_used=0
   fi
 
   info "removing worktree $path"
-  if [[ "$force" -eq 1 ]]; then
+  if [[ "$discard_dirty" -eq 1 ]]; then
     git worktree remove --force "$path"
   else
     if ! git worktree remove "$path"; then
-      die "git worktree remove failed (dirty plate?). Commit/stash, or pass --force to discard"
+      if json_out; then emit_json ok=false operation=down error=worktree-remove-failed slug="$slug" path="$path"; fi
+      die "git worktree remove failed (dirty plate?). Commit/stash, or pass --discard-dirty / --force"
     fi
   fi
   git worktree prune 2>/dev/null || true
@@ -643,7 +717,11 @@ cmd_down() {
   fi
   delete_meta "$slug"
 
-  echo "plate tossed: $slug"
+  if json_out; then
+    emit_json ok=true operation=down slug="$slug" branch="${branch:-}" changed=true
+  else
+    echo "plate tossed: $slug"
+  fi
 }
 
 cmd_list() {
@@ -703,36 +781,67 @@ cmd_list() {
 
 cmd_status() {
   local target="${1:-}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) JSON_OUT=1; shift ;;
+      -h|--help) echo "Usage: treedock status <slug> [--json]"; return 0 ;;
+      *) target="$1"; shift ;;
+    esac
+  done
   [[ -n "$target" ]] || die "status requires a slug"
   need_git
-  local root slug path
+  local root slug path ghost=0
   root="$(main_worktree_root)"
   slug="$(slugify "$target")"
   path="$(plates_dir)/$slug"
   local mp
   mp="$(read_meta_field "$slug" path || true)"
   [[ -n "${mp:-}" && -d "$mp" ]] && path="$mp"
-  [[ -d "$path" ]] || die "plate not found: $path"
-
-  echo "path:    $path"
-  echo "branch:  $(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-  local pm
-  pm="$(detect_install "$path")"
-  echo "install: $pm"
-  if [[ -d "$path/node_modules" ]]; then
-    echo "node_modules: present"
-  else
-    echo "node_modules: absent"
+  if [[ ! -d "$path" ]]; then
+    if [[ -f "$(meta_path "$slug")" ]]; then
+      ghost=1
+      path="${mp:-missing}"
+    else
+      die "plate not found: $path"
+    fi
   fi
-  local project compose_file compose_used
+
+  local branch pm project compose_file compose_used pr_num dirty=false ghost_s=false
+  branch="$(read_meta_field "$slug" branch || true)"
+  if [[ "$ghost" -eq 0 ]]; then
+    branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "${branch:-?}")"
+    pm="$(detect_install "$path")"
+    if plate_is_dirty "$path"; then dirty=true; fi
+  else
+    pm="$(read_meta_field "$slug" install || echo none)"
+    ghost_s=true
+  fi
   project="$(read_meta_field "$slug" compose_project || compose_project "$slug")"
   compose_file="$(read_meta_field "$slug" compose_file || true)"
   compose_used="$(read_meta_field "$slug" compose_used || echo 0)"
+  pr_num="$(read_meta_field "$slug" pr || true)"
+
+  if json_out; then
+    emit_json ok=true operation=status slug="$slug" path="$path" branch="${branch:-}" install="${pm:-}" \
+      compose_project="$project" compose_used="$compose_used" ghost="$ghost_s" \
+      dirty="$dirty" pr="${pr_num:-}" meta="$(meta_path "$slug")"
+    return 0
+  fi
+
+  echo "path:    $path"
+  echo "ghost:   $ghost"
+  echo "branch:  ${branch:-?}"
+  echo "install: ${pm:-}"
+  echo "dirty:   $dirty"
+  if [[ "$ghost" -eq 0 ]]; then
+    if [[ -d "$path/node_modules" ]]; then echo "node_modules: present"; else echo "node_modules: absent"; fi
+  fi
   echo "compose_project: $project"
   echo "compose_used: $compose_used"
+  echo "pr: ${pr_num:-(none)}"
   if [[ -n "${compose_file:-}" ]]; then
     echo "compose_file: $compose_file"
-  elif compose_file="$(find_compose_file "$path")"; then
+  elif [[ "$ghost" -eq 0 ]] && compose_file="$(find_compose_file "$path")"; then
     echo "compose_file: $compose_file"
   else
     echo "compose_file: (none)"
@@ -996,7 +1105,7 @@ print("error unknown-state-%s" % (s or "empty"))
 # Reap plates whose PR/MR is merged or closed (not open). Report-only unless --yes.
 # Reuses `down` invariants. Never deletes branches; logs leftovers to .worktrees/.reaped.log.
 cmd_prune_merged() {
-  local yes="${1:-0}" force="${2:-0}"
+  local yes="${1:-0}" orphan_compose="${2:-0}" discard_dirty="${3:-0}" mode="${4:-finished}"
   need_git
   local root cli
   root="$(main_worktree_root)"
@@ -1030,6 +1139,11 @@ cmd_prune_merged() {
 
     case "$st" in
       merged|closed)
+        # mode: finished reaps merged|closed; merged reaps merged only
+        if [[ "$mode" == "merged" && "$st" != "merged" ]]; then
+          printf "%-22s %-28s %-10s %s\n" "$slug" "${branch:-?}" "$st" "keep (not merged; use --finished)"
+          continue
+        fi
         if [[ "$yes" -ne 1 ]]; then
           action="would-reap (pass --yes)"
           planned=$((planned + 1))
@@ -1037,10 +1151,9 @@ cmd_prune_merged() {
           continue
         fi
         local down_args=("$slug")
-        if [[ "$force" -eq 1 ]]; then
-          down_args+=(--force)
-        fi
-        if [[ -n "$path" && -d "$path" ]] && plate_is_dirty "$path" && [[ "$force" -eq 0 ]]; then
+        if [[ "$discard_dirty" -eq 1 ]]; then down_args+=(--discard-dirty); fi
+        if [[ "$orphan_compose" -eq 1 ]]; then down_args+=(--allow-orphan-compose); fi
+        if [[ -n "$path" && -d "$path" ]] && plate_is_dirty "$path" && [[ "$discard_dirty" -eq 0 ]]; then
           action="skip-dirty"
           failed=$((failed + 1))
           printf "%-22s %-28s %-10s %s\n" "$slug" "${branch:-?}" "$st" "$action $rest"
@@ -1078,13 +1191,27 @@ cmd_prune_merged() {
   done
 
   if [[ "$yes" -ne 1 ]]; then
-    echo "prune --merged plan: $planned candidate(s). Re-run with --yes to reap (no branch delete)."
+    if json_out; then
+      emit_json ok=true operation=prune mode="$mode" planned="$planned" reaped=0 failed="$failed" yes=false
+    else
+      echo "prune --${mode} plan: $planned candidate(s). Re-run with --yes to reap (no branch delete)."
+    fi
     return 0
   fi
-  echo "prune --merged done: reaped=$reaped failed=$failed"
   if [[ ${#leftover_branches[@]} -gt 0 ]]; then
-    echo "leftover local branches (not deleted): ${leftover_branches[*]}"
-    echo "  log: $(plates_dir)/.reaped.log"
+    info "leftover local branches (not deleted): ${leftover_branches[*]}"
+    info "log: $(plates_dir)/.reaped.log"
+  fi
+  local ok_s=true
+  [[ "$failed" -gt 0 ]] && ok_s=false
+  if json_out; then
+    emit_json ok="$ok_s" operation=prune mode="$mode" planned=0 reaped="$reaped" failed="$failed" yes=true
+  else
+    echo "prune --${mode} done: reaped=$reaped failed=$failed"
+    if [[ ${#leftover_branches[@]} -gt 0 ]]; then
+      echo "leftover local branches (not deleted): ${leftover_branches[*]}"
+      echo "  log: $(plates_dir)/.reaped.log"
+    fi
   fi
   if [[ "$failed" -gt 0 ]]; then
     return 1
@@ -1093,19 +1220,23 @@ cmd_prune_merged() {
 }
 
 cmd_prune() {
-  local yes=0 force=0 merged=0
+  local yes=0 force=0 orphan_compose=0 discard_dirty=0 merged=0 finished=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --yes|-y) yes=1; shift ;;
-      --force) force=1; shift ;;
+      --force) force=1; orphan_compose=1; discard_dirty=1; shift ;;
+      --allow-orphan-compose) orphan_compose=1; shift ;;
+      --discard-dirty) discard_dirty=1; shift ;;
       --merged) merged=1; shift ;;
+      --finished) finished=1; shift ;;
+      --json) JSON_OUT=1; shift ;;
       -h|--help)
-        echo "Usage: treedock prune [--yes] [--force]"
-        echo "       treedock prune --merged [--yes] [--force]"
-        echo "  --yes     required to delete orphans / reap finished-PR plates"
-        echo "  --force   allow orphaning compose stacks if teardown fails (with --yes)"
-        echo "  --merged  report/reap plates whose GitHub/GitLab PR/MR is merged or closed"
-        echo "            (gh/glab; skips dirty unless --force; never deletes branches)"
+        echo "Usage: treedock prune [--yes] [--force|--allow-orphan-compose] [--json]"
+        echo "       treedock prune --finished [--yes] [...]   # merged OR closed PRs"
+        echo "       treedock prune --merged [--yes] [...]     # merged only"
+        echo "  --yes       act (otherwise report-only)"
+        echo "  --finished  PR/MR finished (merged or closed)"
+        echo "  --merged    PR/MR merged only"
         return 0
         ;;
       *) die "unknown prune flag: $1" ;;
@@ -1117,8 +1248,10 @@ cmd_prune() {
   root="$(main_worktree_root)"
   cd "$root"
 
-  if [[ "$merged" -eq 1 ]]; then
-    cmd_prune_merged "$yes" "$force"
+  if [[ "$merged" -eq 1 || "$finished" -eq 1 ]]; then
+    local mode=finished
+    [[ "$merged" -eq 1 && "$finished" -eq 0 ]] && mode=merged
+    cmd_prune_merged "$yes" "$orphan_compose" "$discard_dirty" "$mode"
     return $?
   fi
 
@@ -1130,6 +1263,7 @@ cmd_prune() {
   reg_file="$(mktemp)"
   registered_worktree_paths >"$reg_file" || true
   local skipped=0
+  force="$orphan_compose"
 
   if [[ -d "$(plates_dir)" ]]; then
     local d slug project cf d_abs registered mused
@@ -1200,41 +1334,45 @@ cmd_prune() {
 
   rm -f "$reg_file"
   if [[ "$skipped" -gt 0 ]]; then
-    echo "prune complete ($skipped item(s) kept — need --force to orphan)"
-  else
-    echo "prune complete"
+    if json_out; then emit_json ok=false operation=prune skipped="$skipped" error=partial-skip; fi
+    echo "prune complete ($skipped item(s) kept — need --allow-orphan-compose / --force)"
+    return 1
   fi
+  if json_out; then emit_json ok=true operation=prune skipped=0; fi
+  echo "prune complete"
+  return 0
 }
 
 usage() {
   cat <<EOF
-treedock v${VERSION} — paper-plate git worktrees
+treedock v${VERSION} — agent workspace lifecycle
 
 Usage:
-  treedock up <branch-or-slug> [--base <ref>] [--no-docker]
-  treedock up --pr <N> [--base <ref>] [--no-docker]
-  treedock down <slug-or-branch> [--delete-branch] [--force-delete-branch] [--force]
-  treedock list
-  treedock status <slug>
-  treedock prune [--yes] [--force]
-  treedock prune --merged [--yes] [--force]
+  treedock [--json] up <branch|slug> [--base <ref>] [--no-docker] [--no-install] [--update-gitignore]
+  treedock [--json] up --pr <N> [...]
+  treedock [--json] down <slug> [--delete-branch] [--force-delete-branch]
+                   [--discard-dirty] [--allow-orphan-compose] [--force]
+  treedock [--json] list | status <slug>
+  treedock [--json] prune [--yes] [--allow-orphan-compose]
+  treedock [--json] prune --finished|--merged [--yes] [...]
 
 Environment:
-  TREEDOCK_BASE   default base ref for new branches (overrides auto main/master)
+  TREEDOCK_BASE   default base ref for new branches
 
-Safety:
-  non-force down: dirty preflight before compose teardown (no half-toss)
-  down fails closed if compose teardown fails (use --force to orphan)
-  meta kept until branch-delete succeeds (retry: down <slug> --force-delete-branch)
-  ghost down (dir gone) keeps meta if compose_used=1 until teardown or --force
-  prune requires --yes to delete; --force to orphan stacks when teardown fails
-  prune --merged: gh/glab PR status; skips dirty; never deletes branches
-  compose_used=1 is recorded before docker compose up (mid-kill safe)
-  --delete-branch uses git branch -d only; unmerged needs --force-delete-branch
+Agent notes:
+  --json            machine-readable stdout
+  --finished        reap merged OR closed PR plates
+  --merged          reap merged only
+  --discard-dirty / --allow-orphan-compose  split force permissions
+  .worktrees/ ignored via .git/info/exclude by default
 EOF
 }
 
 main() {
+  while [[ "${1:-}" == "--json" ]]; do
+    JSON_OUT=1
+    shift
+  done
   local cmd="${1:-}"
   shift || true
   case "$cmd" in
