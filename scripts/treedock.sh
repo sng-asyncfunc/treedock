@@ -6,7 +6,7 @@
 # Meta is kept until branch-delete succeeds so --force-delete-branch remains retryable.
 set -euo pipefail
 
-VERSION="0.4.2"
+VERSION="0.4.3"
 
 # Absolute path to this script (for re-entry: prune --merged → down).
 TREEDOCK_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -109,7 +109,13 @@ compose_project() {
     echo "$raw"
     return
   fi
-  hash="$(printf '%s' "$raw" | shasum -a 256 2>/dev/null | cut -c1-8 || printf '%s' "$raw" | cksum | awk '{print $1}')"
+  if command -v shasum >/dev/null 2>&1; then
+    hash="$(printf '%s' "$raw" | shasum -a 256 | cut -c1-8)"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    hash="$(printf '%s' "$raw" | sha256sum | cut -c1-8)"
+  else
+    hash="$(printf '%s' "$raw" | cksum | awk '{print $1}')"
+  fi
   base="$(echo "$raw" | cut -c1-$((max - 9)))"
   echo "${base}-${hash}"
 }
@@ -235,7 +241,7 @@ run_install() {
 }
 
 write_meta() {
-  local slug="$1" branch="$2" project="$3" path="$4" compose_file="${5:-}" compose_used="${6:-0}" pm="${7:-none}"
+  local slug="$1" branch="$2" project="$3" path="$4" compose_file="${5:-}" compose_used="${6:-0}" pm="${7:-none}" pr="${8:-}"
   mkdir -p "$(meta_dir)"
   cat >"$(meta_path "$slug")" <<EOF
 # treedock plate registry (outside the worktree — survives failed compose down)
@@ -246,10 +252,11 @@ compose_file=$compose_file
 compose_used=$compose_used
 path=$path
 install=$pm
+pr=$pr
 created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
   # Optional human-visible marker inside plate (gitignored via info/exclude)
-  if [[ -d "$path" ]]; then
+  if [[ -n "$path" && -d "$path" ]]; then
     cat >"$path/.treedock" <<EOF
 # treedock plate marker (also registered at $(meta_path "$slug"))
 slug=$slug
@@ -257,9 +264,20 @@ branch=$branch
 compose_project=$project
 compose_file=$compose_file
 compose_used=$compose_used
+pr=$pr
 created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
   fi
+}
+
+# Append durable record when a finished PR plate is reaped (branch may remain).
+append_reaped_log() {
+  local slug="$1" branch="$2" status="$3" detail="$4"
+  local logf
+  logf="$(plates_dir)/.reaped.log"
+  mkdir -p "$(plates_dir)"
+  printf '%s\tslug=%s\tbranch=%s\tstatus=%s\t%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$branch" "$status" "$detail" >>"$logf"
 }
 
 read_meta_field() {
@@ -323,6 +341,7 @@ cmd_up() {
       --no-docker) no_docker=1; shift ;;
       --pr)
         [[ -n "${2:-}" ]] || die "--pr requires a number"
+        [[ "${2}" =~ ^[0-9]+$ ]] || die "--pr requires a positive integer (got '$2')"
         pr="$2"; shift 2
         ;;
       -h|--help)
@@ -376,7 +395,13 @@ EOF
   # Create worktree first, then write meta early so partial failures remain recoverable.
   if [[ -n "$pr" ]]; then
     info "fetching pull/${pr}/head → ${branch}"
-    git fetch origin "pull/${pr}/head:${branch}"
+    # Allow re-fetch of same PR branch if it already exists locally but not checked out
+    if git show-ref --verify --quiet "refs/heads/${branch}"; then
+      git fetch origin "pull/${pr}/head:refs/heads/${branch}" --force 2>/dev/null \
+        || git fetch origin "pull/${pr}/head:${branch}"
+    else
+      git fetch origin "pull/${pr}/head:${branch}"
+    fi
     git worktree add "$path" "$branch" || die "git worktree add failed for PR $pr"
   elif git show-ref --verify --quiet "refs/heads/${branch}"; then
     # Refuse if already checked out in another worktree (clearer than raw git error)
@@ -398,8 +423,8 @@ EOF
     git worktree add -b "$branch" "$path" "$base" || die "git worktree add failed for branch '${branch}'"
   fi
 
-  # Early meta (compose not up yet)
-  write_meta "$slug" "$branch" "$project" "$path" "" "0" "none"
+  # Early meta (compose not up yet). pr= enables prune --merged for review plates.
+  write_meta "$slug" "$branch" "$project" "$path" "" "0" "none" "$pr"
 
   local pm compose_file="" compose_used=0
   # Install — on failure leave plate + meta for user; do not auto-delete (agent may want the tree)
@@ -407,14 +432,14 @@ EOF
     info "install failed — plate left at $path (meta at $(meta_path "$slug"))"
     die "install failed"
   fi
-  write_meta "$slug" "$branch" "$project" "$path" "" "0" "$pm"
+  write_meta "$slug" "$branch" "$project" "$path" "" "0" "$pm" "$pr"
 
   if [[ "$no_docker" -eq 0 ]]; then
     if compose_file="$(find_compose_file "$path")"; then
       if command -v docker >/dev/null 2>&1; then
         # Mark compose_used BEFORE up so a mid-start kill still tears down on later down.
         compose_used=1
-        write_meta "$slug" "$branch" "$project" "$path" "$compose_file" "1" "$pm"
+        write_meta "$slug" "$branch" "$project" "$path" "$compose_file" "1" "$pm" "$pr"
         info "compose up project=${project} file=${compose_file}"
         if ! (cd "$path" && COMPOSE_PROJECT_NAME="$project" docker compose -p "$project" -f "$compose_file" up -d); then
           info "compose up failed — plate kept; meta has compose_used=1 for treedock down"
@@ -433,7 +458,7 @@ EOF
     compose_file=""
   fi
 
-  write_meta "$slug" "$branch" "$project" "$path" "${compose_file:-}" "$compose_used" "$pm"
+  write_meta "$slug" "$branch" "$project" "$path" "${compose_file:-}" "$compose_used" "$pm" "$pr"
 
   local compose_report="none"
   if [[ "$compose_used" -eq 1 ]]; then
@@ -542,7 +567,9 @@ cmd_down() {
       git worktree prune 2>/dev/null || true
 
       # Keep meta until branch intent finishes so retries still know the branch name.
-      write_meta "$slug" "${branch:-}" "$project" "" "" "0" "none"
+      local pr_num
+      pr_num="$(read_meta_field "$slug" pr || true)"
+      write_meta "$slug" "${branch:-}" "$project" "" "" "0" "none" "${pr_num:-}"
 
       if [[ "$delete_branch" -eq 1 ]]; then
         if ! try_delete_branch "${branch:-}" "$force_delete_branch"; then
@@ -561,6 +588,9 @@ cmd_down() {
   compose_file="${compose_file:-$(read_marker_field "$path" compose_file || true)}"
   branch="${branch:-$(read_marker_field "$path" branch || true)}"
   compose_used="${compose_used:-$(read_marker_field "$path" compose_used || true)}"
+  local pr_num
+  pr_num="$(read_meta_field "$slug" pr || true)"
+  pr_num="${pr_num:-$(read_marker_field "$path" pr || true)}"
   project="${project:-$(compose_project "$slug")}"
   compose_used="${compose_used:-0}"
 
@@ -604,7 +634,7 @@ cmd_down() {
   git worktree prune 2>/dev/null || true
 
   # Persist recovery meta without path so branch-only retries still work.
-  write_meta "$slug" "${branch:-}" "$project" "" "" "0" "none"
+  write_meta "$slug" "${branch:-}" "$project" "" "" "0" "none" "${pr_num:-}"
 
   if [[ "$delete_branch" -eq 1 ]]; then
     if ! try_delete_branch "${branch:-}" "$force_delete_branch"; then
@@ -777,32 +807,107 @@ compose_teardown() {
   return 1
 }
 
-# Prefer gh for GitHub, glab for GitLab. Fail closed if neither is usable.
+# Prefer gh for GitHub remotes, glab for GitLab. No silent cross-host fallthrough.
 detect_pr_cli() {
   local url
   url="$(git remote get-url origin 2>/dev/null || true)"
   case "$url" in
-    *gitlab*)
-      if command -v glab >/dev/null 2>&1; then
+    *gitlab*|*gitLab*)
+      if command -v glab >/dev/null 2>&1 && glab auth status >/dev/null 2>&1; then
         echo glab
         return 0
       fi
+      # authenticated glab unavailable — do not fall through to gh on a GitLab origin
+      return 1
+      ;;
+    *github.com*|*github.*)
+      if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+        echo gh
+        return 0
+      fi
+      return 1
       ;;
   esac
+  # Unknown host: try gh then glab, both auth-checked
   if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
     echo gh
     return 0
   fi
-  if command -v glab >/dev/null 2>&1; then
+  if command -v glab >/dev/null 2>&1 && glab auth status >/dev/null 2>&1; then
     echo glab
     return 0
   fi
   return 1
 }
 
+# Classify by GitHub PR number (for plates created with up --pr N).
+pr_status_for_number_gh() {
+  local num="$1" json st
+  if ! json="$(gh pr view "$num" --json number,state,url,title,headRefName 2>/dev/null)"; then
+    echo "error gh-pr-view-failed"
+    return 0
+  fi
+  python3 -c '
+import json,sys
+try:
+  p=json.load(sys.stdin)
+except Exception:
+  print("error bad-json"); sys.exit(0)
+st=str(p.get("state","")).upper()
+n=p.get("number")
+url=p.get("url") or ""
+head=p.get("headRefName") or ""
+if st=="OPEN":
+  print("open #%s %s head=%s" % (n, url, head)); sys.exit(0)
+if st=="MERGED":
+  print("merged #%s %s head=%s" % (n, url, head)); sys.exit(0)
+if st=="CLOSED":
+  print("closed #%s %s head=%s" % (n, url, head)); sys.exit(0)
+print("error unknown-state-%s" % (st or "empty"))
+' <<<"$json"
+}
+
+pr_status_for_number_glab() {
+  local num="$1" json
+  if ! json="$(glab mr view "$num" -F json 2>/dev/null)"; then
+    if ! json="$(glab mr view "$num" --output json 2>/dev/null)"; then
+      echo "error glab-mr-view-failed"
+      return 0
+    fi
+  fi
+  python3 -c '
+import json,sys
+try:
+  p=json.load(sys.stdin)
+except Exception:
+  print("error bad-json"); sys.exit(0)
+st=str(p.get("state") or p.get("State") or "").lower()
+n=p.get("iid") or p.get("number") or p.get("id")
+url=p.get("web_url") or p.get("url") or ""
+if st in ("opened","open"):
+  print("open !%s %s" % (n, url)); sys.exit(0)
+if st=="merged":
+  print("merged !%s %s" % (n, url)); sys.exit(0)
+if st=="closed":
+  print("closed !%s %s" % (n, url)); sys.exit(0)
+print("error unknown-state-%s" % (st or "empty"))
+' <<<"$json"
+}
+
 # Print: <status> <detail...>
-# status: merged|closed|open|none|error
-# Uses newest PR by number; any OPEN wins over finished states.
+# Prefer meta pr=N (review plates); else match by head branch name.
+pr_status_for_plate() {
+  local branch="$1" cli="$2" pr_num="${3:-}"
+  if [[ -n "$pr_num" ]]; then
+    case "$cli" in
+      gh) pr_status_for_number_gh "$pr_num"; return 0 ;;
+      glab) pr_status_for_number_glab "$pr_num"; return 0 ;;
+    esac
+  fi
+  pr_status_for_branch "$branch" "$cli"
+}
+
+# Print: <status> <detail...> by head branch name.
 pr_status_for_branch() {
   local branch="$1" cli="${2:-}"
   [[ -n "$branch" && "$branch" != "HEAD" ]] || { echo "error no-branch"; return 0; }
@@ -828,11 +933,9 @@ if not isinstance(prs, list):
 if not prs:
   print("none no-pr"); sys.exit(0)
 prs=sorted(prs, key=lambda p: int(p.get("number") or 0), reverse=True)
-# Any open keeps the plate
 opens=[p for p in prs if str(p.get("state","")).upper()=="OPEN"]
 if opens:
   p=opens[0]; print("open #%s %s" % (p.get("number"), p.get("url") or "")); sys.exit(0)
-# Newest PR wins among non-open
 p=prs[0]
 st=str(p.get("state","")).upper()
 if st=="MERGED":
@@ -845,7 +948,6 @@ print("error unknown-state-%s" % (st or "empty"))
     glab)
       local json
       if ! json="$(glab mr list --source-branch "$branch" -A -F json 2>/dev/null)"; then
-        # older glab may use different flags
         if ! json="$(glab mr list --source-branch="$branch" --output json 2>/dev/null)"; then
           echo "error glab-query-failed"
           return 0
@@ -892,7 +994,7 @@ print("error unknown-state-%s" % (s or "empty"))
 }
 
 # Reap plates whose PR/MR is merged or closed (not open). Report-only unless --yes.
-# Reuses `down` invariants (dirty preflight, fail-closed compose). Never deletes branches.
+# Reuses `down` invariants. Never deletes branches; logs leftovers to .worktrees/.reaped.log.
 cmd_prune_merged() {
   local yes="${1:-0}" force="${2:-0}"
   need_git
@@ -901,7 +1003,7 @@ cmd_prune_merged() {
   cd "$root"
 
   if ! cli="$(detect_pr_cli)"; then
-    die "prune --merged requires authenticated gh (GitHub) or glab (GitLab) on PATH"
+    die "prune --merged requires authenticated gh (GitHub) or glab (GitLab) matching origin"
   fi
   info "PR provider: $cli"
 
@@ -911,16 +1013,17 @@ cmd_prune_merged() {
   fi
 
   printf "%-22s %-28s %-10s %s\n" "SLUG" "BRANCH" "STATUS" "ACTION/DETAIL"
-  local mf slug branch path status detail action
-  local reaped=0 skipped=0 failed=0 planned=0
-  local line st rest
+  local mf slug branch path pr_num line st rest action down_out
+  local reaped=0 failed=0 planned=0
+  local leftover_branches=()
 
   for mf in "$(meta_dir)"/*.meta; do
     [[ -f "$mf" ]] || continue
     slug="$(basename "$mf" .meta)"
     branch="$(sed -n 's/^branch=//p' "$mf" | head -1)"
     path="$(sed -n 's/^path=//p' "$mf" | head -1)"
-    line="$(pr_status_for_branch "$branch" "$cli")"
+    pr_num="$(sed -n 's/^pr=//p' "$mf" | head -1)"
+    line="$(pr_status_for_plate "$branch" "$cli" "$pr_num")"
     st="${line%% *}"
     rest="${line#* }"
     [[ "$rest" == "$line" ]] && rest=""
@@ -933,24 +1036,31 @@ cmd_prune_merged() {
           printf "%-22s %-28s %-10s %s\n" "$slug" "${branch:-?}" "$st" "$action $rest"
           continue
         fi
-        # Act: never implicit branch delete; optional --force only for down
         local down_args=("$slug")
         if [[ "$force" -eq 1 ]]; then
           down_args+=(--force)
         fi
         if [[ -n "$path" && -d "$path" ]] && plate_is_dirty "$path" && [[ "$force" -eq 0 ]]; then
           action="skip-dirty"
-          skipped=$((skipped + 1))
           failed=$((failed + 1))
           printf "%-22s %-28s %-10s %s\n" "$slug" "${branch:-?}" "$st" "$action $rest"
           continue
         fi
-        if bash "$TREEDOCK_SELF" down "${down_args[@]}"; then
+        # Capture down noise so the table stays readable for agents
+        if down_out="$(bash "$TREEDOCK_SELF" down "${down_args[@]}" 2>&1)"; then
           action="reaped"
           reaped=$((reaped + 1))
+          append_reaped_log "$slug" "${branch:-}" "$st" "$rest"
+          # Branch may remain (esp. squash); surface evidence for manual cleanup
+          if [[ -n "${branch:-}" ]] && git show-ref --verify --quiet "refs/heads/${branch}"; then
+            leftover_branches+=("$branch")
+            info "local branch still present after reap: ${branch} (squash? git branch -D ${branch})"
+          fi
         else
           action="down-failed"
           failed=$((failed + 1))
+          # show last line of failure for humans
+          info "down failed for $slug: $(echo "$down_out" | tail -1)"
         fi
         printf "%-22s %-28s %-10s %s\n" "$slug" "${branch:-?}" "$st" "$action $rest"
         ;;
@@ -971,7 +1081,11 @@ cmd_prune_merged() {
     echo "prune --merged plan: $planned candidate(s). Re-run with --yes to reap (no branch delete)."
     return 0
   fi
-  echo "prune --merged done: reaped=$reaped skipped_or_failed=$failed"
+  echo "prune --merged done: reaped=$reaped failed=$failed"
+  if [[ ${#leftover_branches[@]} -gt 0 ]]; then
+    echo "leftover local branches (not deleted): ${leftover_branches[*]}"
+    echo "  log: $(plates_dir)/.reaped.log"
+  fi
   if [[ "$failed" -gt 0 ]]; then
     return 1
   fi

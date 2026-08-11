@@ -1,6 +1,6 @@
 ---
 name: treedock
-version: 0.4.2
+version: 0.4.3
 description: >
   Paper-plate git worktrees: cheap, fast, disposable checkouts with shared deps
   (pnpm global virtual store) and matched Docker Compose lifecycle. Use when the
@@ -218,12 +218,15 @@ git worktree list
 **prune --merged** (GitHub `gh` / GitLab `glab`)
 
 - Enumerate **treedock meta plates only** (not arbitrary worktrees)
-- Classify each plate branch: open / merged / closed / none / error
-  (any open keeps the plate; else newest PR’s state; unverified → error,
-  and `--yes` exits non-zero)
+- Classification: if meta has `pr=N` (from `up --pr N`), query that PR/MR by
+  number (`gh pr view N` / `glab mr view N`); else match by head **branch** name
+- States: open / merged / closed / none / error (any open keeps; else newest;
+  unverified → error; `--yes` exits non-zero on error/dirty/down-fail)
 - Report-only by default; **`--yes`** reaps finished (merged **or** closed)
   plates via normal `down` (dirty skip unless `--force`; **never** deletes branches)
-- Fail closed if provider/auth/query fails for a plate (keep it; non-zero exit when acting)
+- After reap, leftover local branches are listed and logged to
+  `.worktrees/.reaped.log` (squash merges often leave branches behind)
+- Fail closed if provider/auth/query fails for a plate
 
 ---
 

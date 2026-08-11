@@ -4,7 +4,7 @@
 
 Git worktrees share objects (good). Fat `node_modules` copies and orphaned compose stacks (bad) are why people say “worktrees must die.” Treedock is the missing teardown half: **one plate = one task**, spin up in seconds, toss when done.
 
-Version: **0.4.2**
+Version: **0.4.3**
 
 ## Install
 
@@ -88,9 +88,10 @@ references/pnpm-worktrees.md
 
 ## Requirements
 
-- `git`
+- `git`, `bash`, **`python3`** (used by `prune --merged` PR JSON parsing)
 - Optional: `pnpm` / `bun` / `yarn` / `npm`, `docker` + Compose v2
 - Optional for `prune --merged`: authenticated `gh` (GitHub) or `glab` (GitLab)
+  matching your `origin` host
 
 ## Related
 
